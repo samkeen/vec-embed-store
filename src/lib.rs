@@ -228,8 +228,6 @@ mod tests {
             Ok(())
         }
     }
-    
-    
 
     async fn get_embed_db() -> (EmbeddingsDb, String) {
         let test_db_path = "test_db";
@@ -243,51 +241,44 @@ mod tests {
         (EmbeddingsDb::new(test_db_path, embedding_engine).await.unwrap(),
          test_db_path.to_string())
     }
-
-
-
+    
     #[tokio::test]
-    async fn create_embed_db() {
-        let (embed_db,temp_dir_path)  = get_embed_db().await;
-        assert_eq!(embed_db.storage_path(), temp_dir_path);
+    async fn test_suite() {
+        // not able to overcome some sort of race-condition/state-issue with construction
+        // of TextEmbedding per test.  Also, not successful in implementing some sort of singleton
+        // pattern over TextEmbedding (use a single instance for all tests)
+        // So... I'm left with this, <shrug>, it works and I have a test suite. 
+        let (embed_db, embed_db_path)  = get_embed_db().await;
+        create_embed_db(&embed_db, &embed_db_path).await;
+        embed_db.empty().await.unwrap();
+        create_embed_db_table(&embed_db).await;
+        embed_db.empty().await.unwrap();
+        create_embeddings(&embed_db).await;
+        embed_db.empty().await.unwrap();
+        test_add_documents(&embed_db).await;
+        embed_db.empty().await.unwrap();
+        test_empty_db(&embed_db).await;
+    }
+    
+    async fn create_embed_db(embed_db: &EmbeddingsDb, embed_db_path: &str) {
+        assert_eq!(embed_db.storage_path(), embed_db_path);
     }
 
-    #[tokio::test]
-    async fn create_embed_db_table() {
-        let binding = TempDir::new().unwrap();
-        let temp_dir_path = binding.path()
-            .to_str().unwrap();
-        let embedding_engine = TextEmbedding::try_new(InitOptions {
-            model_name: EmbeddingModel::AllMiniLML6V2,
-            show_download_progress: true,
-            ..Default::default()
-        }).unwrap();
-        let embed_db = EmbeddingsDb::new(temp_dir_path, embedding_engine).await.unwrap();
+
+    async fn create_embed_db_table(embed_db: &EmbeddingsDb) {
         let table_names = embed_db.get_table_names().await.unwrap();
         assert_eq!(table_names.len(), 1);
         assert_eq!(table_names.first().unwrap(), EMBED_TABLE_NAME);
     }
-
-    #[tokio::test]
-    async fn create_embeddings() {
-        let binding = TempDir::new().unwrap();
-        let temp_dir_path = binding.path()
-            .to_str().unwrap();
-        let embedding_engine = TextEmbedding::try_new(InitOptions {
-            model_name: EmbeddingModel::AllMiniLML6V2,
-            show_download_progress: true,
-            ..Default::default()
-        }).unwrap();
-        let embed_db = EmbeddingsDb::new(temp_dir_path, embedding_engine).await.unwrap();
+    
+    async fn create_embeddings(embed_db: &EmbeddingsDb) {
         let data = vec!["hello world".to_string()];
         let embeddings = embed_db.create_embeddings(&data).unwrap();
         assert_eq!(embeddings.len(), data.len(), "The returned item is one vec per given data item");
         assert_eq!(embeddings[0].len(), 384, "The embeddings within the returned vec should be 384 floats (AllMiniLML6V2 uses 384 dimensions)");
     }
 
-    #[tokio::test]
-    async fn test_add_documents() {
-        let (embed_db, _) = get_embed_db().await;
+    async fn test_add_documents(embed_db: &EmbeddingsDb) {
         let documents: Vec<Document> = vec![
             Document {
                 id: "1".to_string(),
@@ -306,9 +297,7 @@ mod tests {
         assert_eq!("Hello world", record_1.unwrap().text )
     }
     
-    #[tokio::test]
-    async fn test_empty_db() {
-        let (embed_db, _) = get_embed_db().await;
+    async fn test_empty_db(embed_db: &EmbeddingsDb) {
         let documents: Vec<Document> = vec![
             Document {
                 id: "1".to_string(),
