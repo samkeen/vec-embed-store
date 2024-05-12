@@ -109,6 +109,12 @@ impl EmbeddingsDb {
         Ok(())
     }
 
+    pub(crate) async fn empty(&self) -> Result<(), EmbedDbError> {
+        self.vec_db.drop_table(EMBED_TABLE_NAME).await?;
+        self.init_table(EMBED_TABLE_NAME).await?;
+        Ok(())
+    }
+
     pub(crate) async fn get_document_by_id(&self, id: &str) -> Result<Vec<Document>, EmbedDbError> {
         let filter = format!("id = '{}'", id);
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
@@ -298,12 +304,30 @@ mod tests {
         let record_1 = embed_db.get_document_by_id("1").await.unwrap().pop();
         assert!(record_1.is_some());
         assert_eq!("Hello world", record_1.unwrap().text )
-
-
-
+    }
+    
+    #[tokio::test]
+    async fn test_empty_db() {
+        let (embed_db, _) = get_embed_db().await;
+        let documents: Vec<Document> = vec![
+            Document {
+                id: "1".to_string(),
+                text: "Hello world".to_string(),
+            },
+            Document {
+                id: "2".to_string(),
+                text: "Rust programming".to_string(),
+            },
+        ];
+        embed_db.add_documents(documents).await.unwrap();
+        assert_eq!(embed_db.documents_count().await.unwrap(), 2,
+                   "Just added 2 docs so expecting 2 from table count");
+        embed_db.empty().await;
+        let count = embed_db.documents_count().await.unwrap();
+        assert_eq!(count, 0);
+        
     }
 
-    // TODO Remember to test if nullable = false keeps you from having to wrap in Options<>
 
 
 }
