@@ -21,16 +21,16 @@ struct EmbeddingsDb {
 
 pub struct SimilaritySearch<'a> {
     embed_db: &'a EmbeddingsDb,
-    document: Document,
+    embed_text: EmbedText,
     threshold: Option<f32>,
     limit: Option<usize>,
 }
 
 impl<'a> SimilaritySearch<'a> {
-    pub fn new(embed_db: &'a EmbeddingsDb, document: Document) -> Self {
+    pub fn new(embed_db: &'a EmbeddingsDb, embed_text: EmbedText) -> Self {
         SimilaritySearch {
             embed_db,
-            document,
+            embed_text,
             threshold: None,
             limit: None,
         }
@@ -46,12 +46,8 @@ impl<'a> SimilaritySearch<'a> {
         self
     }
 
-    ///
-    /// Note query.rs::refine_factor is the only mention of '_distance'
-    /// RESEARCH ^^^^^^
-    ///
-    pub async fn execute(self) -> Result<Vec<ComparedDocument>, EmbedDbError> {
-        let embedding = self.embed_db.create_embeddings(&[self.document.text])?;
+    pub async fn execute(self) -> Result<Vec<ComparedEmbedText>, EmbedDbError> {
+        let embedding = self.embed_db.create_embeddings(&[self.embed_text.text])?;
         // flattening a 2D vector into a 1D vector. This is necessary because the search
         // function of the Table trait expects a 1D vector as input. However, the
         // create_embeddings function returns a 2D vector (a vector of embeddings,
@@ -77,39 +73,21 @@ impl<'a> SimilaritySearch<'a> {
             query
         };
         let result = query.execute().await?.try_collect::<Vec<_>>().await?;
-        convert_to_compared_documents(result, &self.threshold)
+        convert_to_compared_embed_texts(result, &self.threshold)
     }
 }
 
-// Define the Embeddable trait
-trait Embeddable {
-    fn id(&self) -> &String;
-    fn text(&self) -> &String;
-}
-
-// Define the Document struct
 #[derive(Deserialize, Clone)]
-struct Document {
-    id: String,
-    text: String,
+pub struct EmbedText {
+    pub id: String,
+    pub text: String,
 }
 #[derive(Deserialize, Clone)]
-struct ComparedDocument {
-    id: String,
-    text: String,
+pub struct ComparedEmbedText {
+    pub id: String,
+    pub text: String,
     #[serde(rename = "_distance")]
-    distance: f32,
-}
-
-// Implement the Embeddable trait for Document
-impl Embeddable for Document {
-    fn id(&self) -> &String {
-        &self.id
-    }
-
-    fn text(&self) -> &String {
-        &self.text
-    }
+    pub distance: f32,
 }
 
 impl EmbeddingsDb {
@@ -127,8 +105,8 @@ impl EmbeddingsDb {
         Ok(embed_db)
     }
 
-    pub(crate) async fn get_table_names(&self) -> Result<Vec<String>, lancedb::error::Error> {
-        Ok(self.vec_db.table_names().execute().await?)
+    pub async fn get_table_names(&self) -> Result<Vec<String>, lancedb::error::Error> {
+        self.vec_db.table_names().execute().await
     }
 
     async fn init_table(&self, table_name: &str) -> Result<(), lancedb::error::Error> {
@@ -159,12 +137,9 @@ impl EmbeddingsDb {
         ]))
     }
 
-    pub(crate) async fn add_documents<T: Embeddable>(
-        &self,
-        data: Vec<T>,
-    ) -> Result<(), EmbedDbError> {
-        let ids: Vec<String> = data.iter().map(|doc| doc.id().to_string()).collect();
-        let texts: Vec<String> = data.iter().map(|doc| doc.text().to_string()).collect();
+    pub async fn add_texts(&self, data: Vec<EmbedText>) -> Result<(), EmbedDbError> {
+        let ids: Vec<String> = data.iter().map(|doc| doc.id.to_string()).collect();
+        let texts: Vec<String> = data.iter().map(|doc| doc.text.to_string()).collect();
         assert_eq!(
             ids.len(),
             texts.len(),
@@ -176,7 +151,7 @@ impl EmbeddingsDb {
             EMBEDDING_DIMENSIONS,
             "Embedding dimensions mismatch"
         );
-        log::info!("Saving Documents: {:?}", ids);
+        log::info!("Saving Texts: {:?}", ids);
         // get record batch stream
         let records_batch = self
             .get_record_batch_stream(self.get_table_schema(), ids, texts, embeddings)
@@ -186,13 +161,16 @@ impl EmbeddingsDb {
         Ok(())
     }
 
-    pub(crate) async fn empty(&self) -> Result<(), EmbedDbError> {
+    pub async fn empty_db(&self) -> Result<(), EmbedDbError> {
         self.vec_db.drop_table(EMBED_TABLE_NAME).await?;
         self.init_table(EMBED_TABLE_NAME).await?;
         Ok(())
     }
 
-    pub(crate) async fn get_document_by_id(&self, id: &str) -> Result<Vec<Document>, EmbedDbError> {
+    pub async fn get_text_by_id(
+        &self,
+        id: &str,
+    ) -> Result<Vec<EmbedText>, EmbedDbError> {
         let filter = format!("id = '{}'", id);
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         let result = table
@@ -211,19 +189,18 @@ impl EmbeddingsDb {
                 result.len()
             );
         }
-        let documents = convert_to_documents(result)?;
-        Ok(documents)
+        convert_to_embed_texts(result)
     }
 
-    pub fn get_similar_to(&self, document: Document) -> SimilaritySearch {
-        SimilaritySearch::new(self, document)
+    pub fn get_similar_to(&self, embed_text: EmbedText) -> SimilaritySearch {
+        SimilaritySearch::new(self, embed_text)
     }
 
-    pub(crate) async fn create_index(table: &Table) -> lancedb::Result<()> {
+    pub async fn create_index(table: &Table) -> lancedb::Result<()> {
         table.create_index(&["vector"], Index::Auto).execute().await
     }
 
-    pub(crate) async fn documents_count(&self) -> Result<usize, EmbedDbError> {
+    pub async fn items_count(&self) -> Result<usize, EmbedDbError> {
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         Ok(table.count_rows(None).await?)
     }
@@ -277,36 +254,36 @@ impl EmbeddingsDb {
         self.vec_db.uri().to_string()
     }
 
-    pub fn create_embeddings(&self, documents: &[String]) -> Result<Vec<Embedding>, EmbedDbError> {
+    pub fn create_embeddings(&self, texts: &[String]) -> Result<Vec<Embedding>, EmbedDbError> {
         self.embedding_engine
-            .embed(documents.to_vec(), None)
+            .embed(texts.to_vec(), None)
             .map_err(EmbedDbError::from)
     }
 }
 
-fn convert_to_documents(result: Vec<RecordBatch>) -> Result<Vec<Document>, EmbedDbError> {
-    let mut documents: Vec<Document> = Vec::new();
+fn convert_to_embed_texts(result: Vec<RecordBatch>) -> Result<Vec<EmbedText>, EmbedDbError> {
+    let mut texts: Vec<EmbedText> = Vec::new();
     for item in result {
-        let x: Vec<Document> = serde_arrow::from_record_batch(&item)?;
-        documents.extend(x);
+        let x: Vec<EmbedText> = serde_arrow::from_record_batch(&item)?;
+        texts.extend(x);
     }
-    Ok(documents)
+    Ok(texts)
 }
 
-fn convert_to_compared_documents(
+fn convert_to_compared_embed_texts(
     result: Vec<RecordBatch>,
     threshold: &Option<f32>,
-) -> Result<Vec<ComparedDocument>, EmbedDbError> {
-    let mut documents: Vec<ComparedDocument> = Vec::new();
+) -> Result<Vec<ComparedEmbedText>, EmbedDbError> {
+    let mut compared_embed_texts: Vec<ComparedEmbedText> = Vec::new();
     for item in result {
-        let x: Vec<ComparedDocument> = serde_arrow::from_record_batch(&item)?;
+        let x: Vec<ComparedEmbedText> = serde_arrow::from_record_batch(&item)?;
         if let Some(threshold_value) = threshold {
-            documents.extend(x.into_iter().filter(|doc| &doc.distance <= threshold_value));
+            compared_embed_texts.extend(x.into_iter().filter(|doc| &doc.distance <= threshold_value));
         } else {
-            documents.extend(x);
+            compared_embed_texts.extend(x);
         }
     }
-    Ok(documents)
+    Ok(compared_embed_texts)
 }
 
 #[derive(Error, Debug)]
@@ -351,13 +328,13 @@ mod tests {
         )
     }
 
-    fn get_docs() -> Vec<Document> {
+    fn get_texts() -> Vec<EmbedText> {
         vec![
-            Document {
+            EmbedText {
                 id: "1".to_string(),
                 text: "Hello world".to_string(),
             },
-            Document {
+            EmbedText {
                 id: "2".to_string(),
                 text: "Rust programming".to_string(),
             },
@@ -372,16 +349,16 @@ mod tests {
         // So... I'm left with this, <shrug>, it works and I have a test suite.
         let (embed_db, embed_db_path) = get_embed_db().await;
         create_embed_db(&embed_db, &embed_db_path).await;
-        embed_db.empty().await.unwrap();
+        embed_db.empty_db().await.unwrap();
         create_embed_db_table(&embed_db).await;
-        embed_db.empty().await.unwrap();
+        embed_db.empty_db().await.unwrap();
         create_embeddings(&embed_db).await;
-        embed_db.empty().await.unwrap();
-        test_add_documents(&embed_db).await;
-        embed_db.empty().await.unwrap();
+        embed_db.empty_db().await.unwrap();
+        test_add_texts(&embed_db).await;
+        embed_db.empty_db().await.unwrap();
         test_empty_db(&embed_db).await;
-        embed_db.empty().await.unwrap();
-        test_get_similar_documents(&embed_db).await;
+        embed_db.empty_db().await.unwrap();
+        test_get_similar_texts(&embed_db).await;
     }
 
     async fn create_embed_db(embed_db: &EmbeddingsDb, embed_db_path: &str) {
@@ -405,36 +382,36 @@ mod tests {
         assert_eq!(embeddings[0].len() as i32, EMBEDDING_DIMENSIONS, "The embeddings within the returned vec should be 384 floats (AllMiniLML6V2 uses 384 dimensions)");
     }
 
-    async fn test_add_documents(embed_db: &EmbeddingsDb) {
-        let documents = get_docs();
-        embed_db.add_documents(documents).await.unwrap();
+    async fn test_add_texts(embed_db: &EmbeddingsDb) {
+        let texts = get_texts();
+        embed_db.add_texts(texts).await.unwrap();
         assert_eq!(
-            embed_db.documents_count().await.unwrap(),
+            embed_db.items_count().await.unwrap(),
             2,
             "Just added 2 docs so expecting 2 from table count"
         );
-        let record_1 = embed_db.get_document_by_id("1").await.unwrap().pop();
+        let record_1 = embed_db.get_text_by_id("1").await.unwrap().pop();
         assert!(record_1.is_some());
         assert_eq!("Hello world", record_1.unwrap().text)
     }
 
     async fn test_empty_db(embed_db: &EmbeddingsDb) {
-        let documents = get_docs();
-        embed_db.add_documents(documents).await.unwrap();
+        let texts = get_texts();
+        embed_db.add_texts(texts).await.unwrap();
         assert_eq!(
-            embed_db.documents_count().await.unwrap(),
+            embed_db.items_count().await.unwrap(),
             2,
             "Just added 2 docs so expecting 2 from table count"
         );
-        embed_db.empty().await;
-        let count = embed_db.documents_count().await.unwrap();
+        embed_db.empty_db().await.unwrap();
+        let count = embed_db.items_count().await.unwrap();
         assert_eq!(count, 0);
     }
 
-    async fn test_get_similar_documents(embed_db: &EmbeddingsDb) {
-        let documents = get_docs();
-        embed_db.add_documents(documents).await.unwrap();
-        let search_doc = Document {
+    async fn test_get_similar_texts(embed_db: &EmbeddingsDb) {
+        let texts = get_texts();
+        embed_db.add_texts(texts).await.unwrap();
+        let search_doc = EmbedText {
             id: "3".to_string(),
             text: "Hello world".to_string(),
         };
@@ -469,11 +446,18 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        assert_eq!(result.len(), 1, "very small threshold, so we should only 1 doc returned");
+        assert_eq!(
+            result.len(),
+            1,
+            "very small threshold, so we should only 1 doc returned"
+        );
         assert_eq!(
             result[0].id, "1",
             "The compare doc and doc 1 share the same text so it should return"
         );
-        assert_eq!(result[0].distance, 0.0, "the docs are identical so distance should be 0")
+        assert_eq!(
+            result[0].distance, 0.0,
+            "the docs are identical so distance should be 0"
+        )
     }
 }
