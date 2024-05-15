@@ -1480,25 +1480,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a47c1c47d2f5964e29c61246e81db715514cd532db6b5116a25ea3c03d6780a2"
 
 [[package]]
-name = "embeddings_db"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arrow-array",
- "arrow-schema",
- "fastembed",
- "futures",
- "lancedb",
- "lazy_static",
- "log",
- "serde",
- "serde_arrow",
- "tempfile",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "encode_unicode"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4462,6 +4443,25 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vec-embed-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow-array",
+ "arrow-schema",
+ "fastembed",
+ "futures",
+ "lancedb",
+ "lazy_static",
+ "log",
+ "serde",
+ "serde_arrow",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "version_check"

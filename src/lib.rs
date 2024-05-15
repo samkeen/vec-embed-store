@@ -1,6 +1,18 @@
+//! A library for storing and searching text embeddings using a vector database.
+//!
+//! This library provides an `EmbeddingsDb` struct for managing a database of text embeddings,
+//! allowing efficient storage, retrieval, and similarity search.
+//!
+//! The key components of the library include:
+//! - `EmbeddingsDb`: The main struct for interacting with the embeddings database.
+//! - `SimilaritySearch`: A builder-style struct for performing similarity searches on the embeddings.
+//! - `EmbedText`: A struct representing a text to be embedded and stored in the database.
+//! - `ComparedEmbedText`: A struct representing a text with its similarity distance after a search.
+//! - `EmbeddingEngineOptions`: A struct for configuring the embedding engine options.
+use std::path::{Path, PathBuf};
 use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
-use fastembed::{Embedding, TextEmbedding};
+use fastembed::{Embedding, EmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding};
 use futures::TryStreamExt;
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::arrow::IntoArrow;
@@ -14,20 +26,25 @@ use thiserror::Error;
 
 const EMBED_TABLE_NAME: &str = "note_embeddings";
 const EMBEDDING_DIMENSIONS: i32 = 384;
+const DEFAULT_EMBEDDINGS_CACHE_DIR: &str = ".fastembed_cache";
+
+/// The main struct for interacting with the embeddings database.
 struct EmbeddingsDb {
     vec_db: Connection,
     embedding_engine: TextEmbedding,
 }
 
+/// A builder-style struct for performing similarity searches on the embeddings.
 pub struct SimilaritySearch<'a> {
     embed_db: &'a EmbeddingsDb,
-    embed_text: EmbedText,
+    embed_text: TextBlock,
     threshold: Option<f32>,
     limit: Option<usize>,
 }
 
 impl<'a> SimilaritySearch<'a> {
-    pub fn new(embed_db: &'a EmbeddingsDb, embed_text: EmbedText) -> Self {
+    /// Creates a new `SimilaritySearch` instance.
+    pub fn new(embed_db: &'a EmbeddingsDb, embed_text: TextBlock) -> Self {
         SimilaritySearch {
             embed_db,
             embed_text,
@@ -36,17 +53,20 @@ impl<'a> SimilaritySearch<'a> {
         }
     }
 
+    /// Sets the similarity threshold for the search.
     pub fn threshold(mut self, threshold: f32) -> Self {
         self.threshold = Some(threshold);
         self
     }
 
+    /// Sets the maximum number of results to return.
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
         self
     }
 
-    pub async fn execute(self) -> Result<Vec<ComparedEmbedText>, EmbedDbError> {
+    /// Executes the similarity search and returns the results.
+    pub async fn execute(self) -> Result<Vec<ComparedTextBlock>, EmbedDbError> {
         let embedding = self.embed_db.create_embeddings(&[self.embed_text.text])?;
         // flattening a 2D vector into a 1D vector. This is necessary because the search
         // function of the Table trait expects a 1D vector as input. However, the
@@ -77,24 +97,56 @@ impl<'a> SimilaritySearch<'a> {
     }
 }
 
-#[derive(Deserialize, Clone)]
-pub struct EmbedText {
+/// A struct representing a text to be embedded and stored in the database.
+#[derive(Deserialize, Clone, Debug)]
+pub struct TextBlock {
     pub id: String,
     pub text: String,
 }
-#[derive(Deserialize, Clone)]
-pub struct ComparedEmbedText {
+
+/// A struct representing a text with its similarity distance after a search.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ComparedTextBlock {
     pub id: String,
     pub text: String,
     #[serde(rename = "_distance")]
     pub distance: f32,
 }
 
+/// A struct for configuring the embedding engine options.
+#[derive(Debug, Clone)]
+pub struct EmbeddingEngineOptions {
+    // pub model_name: EmbeddingModel,
+    // pub execution_providers: Vec<ExecutionProviderDispatch>,
+    // pub max_length: usize,
+    pub cache_dir: PathBuf,
+    pub show_download_progress: bool,
+}
+
+impl Default for EmbeddingEngineOptions {
+    fn default() -> Self {
+        Self {
+            // model_name: DEFAULT_EMBEDDING_MODEL,
+            // execution_providers: Default::default(),
+            // max_length: DEFAULT_MAX_LENGTH,
+            cache_dir: Path::new(DEFAULT_EMBEDDINGS_CACHE_DIR).to_path_buf(),
+            show_download_progress: true,
+        }
+    }
+}
+
 impl EmbeddingsDb {
+    /// Creates a new instance of `EmbeddingsDb`.
     pub async fn new(
         db_path: &str,
-        embedding_engine: TextEmbedding,
-    ) -> Result<EmbeddingsDb, lancedb::error::Error> {
+        embedding_engine_options: EmbeddingEngineOptions
+    ) -> Result<EmbeddingsDb, EmbedDbError> {
+        let embedding_engine = TextEmbedding::try_new(InitOptions {
+            model_name: EmbeddingModel::AllMiniLML6V2,
+            show_download_progress: embedding_engine_options.show_download_progress,
+            cache_dir: embedding_engine_options.cache_dir,
+            ..Default::default()
+        })?;
         let db_conn = connect(db_path).execute().await?;
         let embed_db = EmbeddingsDb {
             vec_db: db_conn,
@@ -105,11 +157,13 @@ impl EmbeddingsDb {
         Ok(embed_db)
     }
 
-    pub async fn get_table_names(&self) -> Result<Vec<String>, lancedb::error::Error> {
-        self.vec_db.table_names().execute().await
+    /// Retrieves the names of all tables in the database.
+    pub async fn get_table_names(&self) -> Result<Vec<String>, EmbedDbError> {
+        self.vec_db.table_names().execute().await.map_err(EmbedDbError::LanceDb)
     }
 
-    async fn init_table(&self, table_name: &str) -> Result<(), lancedb::error::Error> {
+    /// Initializes the embeddings table if it doesn't exist.
+    async fn init_table(&self, table_name: &str) -> Result<(), EmbedDbError> {
         let table_names = self.vec_db.table_names().execute().await?;
         let table_exists = table_names.contains(&table_name.to_string());
         if !table_exists {
@@ -122,6 +176,7 @@ impl EmbeddingsDb {
         Ok(())
     }
 
+    /// Retrieves the schema for the embeddings table.
     fn get_table_schema(&self) -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
@@ -137,7 +192,8 @@ impl EmbeddingsDb {
         ]))
     }
 
-    pub async fn add_texts(&self, data: Vec<EmbedText>) -> Result<(), EmbedDbError> {
+    /// Adds a batch of texts to the embeddings database.
+    pub async fn add_texts(&self, data: Vec<TextBlock>) -> Result<(), EmbedDbError> {
         let ids: Vec<String> = data.iter().map(|doc| doc.id.to_string()).collect();
         let texts: Vec<String> = data.iter().map(|doc| doc.text.to_string()).collect();
         assert_eq!(
@@ -161,16 +217,18 @@ impl EmbeddingsDb {
         Ok(())
     }
 
+    /// Clears all data from the embeddings database.
     pub async fn empty_db(&self) -> Result<(), EmbedDbError> {
         self.vec_db.drop_table(EMBED_TABLE_NAME).await?;
         self.init_table(EMBED_TABLE_NAME).await?;
         Ok(())
     }
 
+    /// Retrieves a text from the database by its ID.
     pub async fn get_text_by_id(
         &self,
         id: &str,
-    ) -> Result<Vec<EmbedText>, EmbedDbError> {
+    ) -> Result<Vec<TextBlock>, EmbedDbError> {
         let filter = format!("id = '{}'", id);
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         let result = table
@@ -192,19 +250,23 @@ impl EmbeddingsDb {
         convert_to_embed_texts(result)
     }
 
-    pub fn get_similar_to(&self, embed_text: EmbedText) -> SimilaritySearch {
+    /// Creates a new `SimilaritySearch` instance for finding similar texts.
+    pub fn get_similar_to(&self, embed_text: TextBlock) -> SimilaritySearch {
         SimilaritySearch::new(self, embed_text)
     }
 
+    /// Creates an index on the embeddings table.
     pub async fn create_index(table: &Table) -> lancedb::Result<()> {
         table.create_index(&["vector"], Index::Auto).execute().await
     }
 
+    /// Retrieves the total number of items in the embeddings database.
     pub async fn items_count(&self) -> Result<usize, EmbedDbError> {
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         Ok(table.count_rows(None).await?)
     }
 
+    /// Generates a record batch stream from the provided data.
     async fn get_record_batch_stream(
         &self,
         schema: SchemaRef,
@@ -242,41 +304,46 @@ impl EmbeddingsDb {
                     ),
                 ],
             )
-            .unwrap()]
-            .into_iter()
-            .map(Ok),
+                .unwrap()]
+                .into_iter()
+                .map(Ok),
             schema.clone(),
         );
         Ok(Box::new(batches))
     }
 
-    pub fn storage_path(&self) -> String {
+    /// Retrieves the storage path of the embeddings database.
+    pub(crate) fn storage_path(&self) -> String {
         self.vec_db.uri().to_string()
     }
 
-    pub fn create_embeddings(&self, texts: &[String]) -> Result<Vec<Embedding>, EmbedDbError> {
+    /// Creates embeddings for the given texts using the embedding engine.
+    pub(crate) fn create_embeddings(&self, texts: &[String]) -> Result<Vec<Embedding>, EmbedDbError> {
         self.embedding_engine
             .embed(texts.to_vec(), None)
             .map_err(EmbedDbError::from)
     }
 }
 
-fn convert_to_embed_texts(result: Vec<RecordBatch>) -> Result<Vec<EmbedText>, EmbedDbError> {
-    let mut texts: Vec<EmbedText> = Vec::new();
+/// Converts the record batch result to a vector of `EmbedText` instances.
+fn convert_to_embed_texts(result: Vec<RecordBatch>) -> Result<Vec<TextBlock>, EmbedDbError> {
+    let mut texts: Vec<TextBlock> = Vec::new();
     for item in result {
-        let x: Vec<EmbedText> = serde_arrow::from_record_batch(&item)?;
+        let x: Vec<TextBlock> = serde_arrow::from_record_batch(&item)?;
         texts.extend(x);
     }
     Ok(texts)
 }
 
+/// Converts the record batch result to a vector of `ComparedEmbedText` instances,
+/// filtering based on the provided threshold.
 fn convert_to_compared_embed_texts(
     result: Vec<RecordBatch>,
     threshold: &Option<f32>,
-) -> Result<Vec<ComparedEmbedText>, EmbedDbError> {
-    let mut compared_embed_texts: Vec<ComparedEmbedText> = Vec::new();
+) -> Result<Vec<ComparedTextBlock>, EmbedDbError> {
+    let mut compared_embed_texts: Vec<ComparedTextBlock> = Vec::new();
     for item in result {
-        let x: Vec<ComparedEmbedText> = serde_arrow::from_record_batch(&item)?;
+        let x: Vec<ComparedTextBlock> = serde_arrow::from_record_batch(&item)?;
         if let Some(threshold_value) = threshold {
             compared_embed_texts.extend(x.into_iter().filter(|doc| &doc.distance <= threshold_value));
         } else {
@@ -299,7 +366,6 @@ pub enum EmbedDbError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastembed::{EmbeddingModel, InitOptions};
     use std::fs;
     use std::path::Path;
 
@@ -314,27 +380,24 @@ mod tests {
     async fn get_embed_db() -> (EmbeddingsDb, String) {
         let test_db_path = "test_db";
         remove_dir_if_exists(test_db_path).expect("Failed removing test db dir");
-        let embedding_engine = TextEmbedding::try_new(InitOptions {
-            model_name: EmbeddingModel::AllMiniLML6V2,
-            show_download_progress: true,
+        let embedding_engine_options = EmbeddingEngineOptions {
             ..Default::default()
-        })
-        .unwrap();
+        };
         (
-            EmbeddingsDb::new(test_db_path, embedding_engine)
+            EmbeddingsDb::new(test_db_path, embedding_engine_options)
                 .await
                 .unwrap(),
             test_db_path.to_string(),
         )
     }
 
-    fn get_texts() -> Vec<EmbedText> {
+    fn get_texts() -> Vec<TextBlock> {
         vec![
-            EmbedText {
+            TextBlock {
                 id: "1".to_string(),
                 text: "Hello world".to_string(),
             },
-            EmbedText {
+            TextBlock {
                 id: "2".to_string(),
                 text: "Rust programming".to_string(),
             },
@@ -411,7 +474,7 @@ mod tests {
     async fn test_get_similar_texts(embed_db: &EmbeddingsDb) {
         let texts = get_texts();
         embed_db.add_texts(texts).await.unwrap();
-        let search_doc = EmbedText {
+        let search_doc = TextBlock {
             id: "3".to_string(),
             text: "Hello world".to_string(),
         };
