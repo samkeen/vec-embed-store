@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use arrow_array::types::Float32Type;
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
-use fastembed::{Embedding, EmbeddingModel, ExecutionProviderDispatch, InitOptions, TextEmbedding};
+use fastembed::{Embedding, EmbeddingModel, InitOptions, TextEmbedding};
 use futures::TryStreamExt;
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::arrow::IntoArrow;
@@ -29,7 +29,7 @@ const EMBEDDING_DIMENSIONS: i32 = 384;
 const DEFAULT_EMBEDDINGS_CACHE_DIR: &str = ".fastembed_cache";
 
 /// The main struct for interacting with the embeddings database.
-struct EmbeddingsDb {
+pub struct EmbeddingsDb {
     vec_db: Connection,
     embedding_engine: TextEmbedding,
 }
