@@ -4,31 +4,32 @@
 //! allowing efficient storage, retrieval, and similarity search.
 //!
 //! The key components of the library include:
-//! - `EmbeddingsDb`: The main struct for interacting with the embeddings database.
+//! - `EmbeddingsDb`: The main struct for interacting with the embeddings' database.
 //! - `SimilaritySearch`: A builder-style struct for performing similarity searches on the embeddings.
 //! - `EmbedText`: A struct representing a text to be embedded and stored in the database.
 //! - `ComparedEmbedText`: A struct representing a text with its similarity distance after a search.
 //! - `EmbeddingEngineOptions`: A struct for configuring the embedding engine options.
 use std::path::{Path, PathBuf};
-use arrow_array::types::Float32Type;
+use std::sync::Arc;
+
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
+use arrow_array::types::Float32Type;
+use arrow_schema::ArrowError;
 use fastembed::{Embedding, EmbeddingModel, InitOptions, TextEmbedding};
 use futures::TryStreamExt;
+use lancedb::{connect, Connection, Table};
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
-use lancedb::arrow::IntoArrow;
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use lancedb::{connect, Connection, Table};
 use log::warn;
 use serde::Deserialize;
-use std::sync::Arc;
 use thiserror::Error;
 
 const EMBED_TABLE_NAME: &str = "note_embeddings";
 const EMBEDDING_DIMENSIONS: i32 = 384;
 const DEFAULT_EMBEDDINGS_CACHE_DIR: &str = ".fastembed_cache";
 
-/// The main struct for interacting with the embeddings database.
+/// The main struct for interacting with the embeddings' database.
 pub struct EmbeddingsDb {
     vec_db: Connection,
     embedding_engine: TextEmbedding,
@@ -84,7 +85,7 @@ impl<'a> SimilaritySearch<'a> {
             .await?;
         let query = table
             .query()
-            .select(Select::Columns(vec!["id".to_string(), "text".to_string()]))
+            .select(EmbeddingsDb::select_columns())
             .nearest_to(embedding)?;
 
         let query = if let Some(limit) = self.limit {
@@ -139,7 +140,7 @@ impl EmbeddingsDb {
     /// Creates a new instance of `EmbeddingsDb`.
     pub async fn new(
         db_path: &str,
-        embedding_engine_options: EmbeddingEngineOptions
+        embedding_engine_options: EmbeddingEngineOptions,
     ) -> Result<EmbeddingsDb, EmbedDbError> {
         let embedding_engine = TextEmbedding::try_new(InitOptions {
             model_name: EmbeddingModel::AllMiniLML6V2,
@@ -159,7 +160,11 @@ impl EmbeddingsDb {
 
     /// Retrieves the names of all tables in the database.
     pub async fn get_table_names(&self) -> Result<Vec<String>, EmbedDbError> {
-        self.vec_db.table_names().execute().await.map_err(EmbedDbError::LanceDb)
+        self.vec_db
+            .table_names()
+            .execute()
+            .await
+            .map_err(EmbedDbError::LanceDb)
     }
 
     /// Initializes the embeddings table if it doesn't exist.
@@ -192,29 +197,69 @@ impl EmbeddingsDb {
         ]))
     }
 
-    /// Adds a batch of texts to the embeddings database.
-    pub async fn add_texts(&self, data: Vec<TextBlock>) -> Result<(), EmbedDbError> {
-        let ids: Vec<String> = data.iter().map(|doc| doc.id.to_string()).collect();
-        let texts: Vec<String> = data.iter().map(|doc| doc.text.to_string()).collect();
-        assert_eq!(
-            ids.len(),
-            texts.len(),
-            "The length of all data attribute vectors must all be the same"
-        );
-        let embeddings = self.create_embeddings(&texts)?;
-        assert_eq!(
-            embeddings[0].len() as i32,
-            EMBEDDING_DIMENSIONS,
-            "Embedding dimensions mismatch"
-        );
-        log::info!("Saving Texts: {:?}", ids);
-        // get record batch stream
-        let records_batch = self
-            .get_record_batch_stream(self.get_table_schema(), ids, texts, embeddings)
-            .await?;
+    pub async fn upsert_texts(&self, texts: &[TextBlock]) -> Result<(), EmbedDbError> {
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
-        table.add(records_batch).execute().await?;
+        // Extract the ids and texts from the input TextBlock vector
+        let ids: Vec<String> = texts.iter().map(|doc| doc.id.to_string()).collect();
+        let texts: Vec<String> = texts.iter().map(|doc| doc.text.to_string()).collect();
+        // Create embeddings for the texts using the embedding engine
+        let embeddings = self.create_embeddings(&texts)?;
+        // Get the schema for the embeddings table
+        let schema = self.get_table_schema();
+        // Wrap the embeddings in Options to match the expected format for FixedSizeListArray
+        // vec![
+        //    Some(vec![Some(0), Some(1), Some(2)]),
+        //    Some(vec![Some(6), Some(7), Some(45)]),
+        // ];
+        let option_wrapped_embeddings: Vec<_> = embeddings
+            .into_iter()
+            .map(|vec| Some(vec.into_iter().map(Some).collect::<Vec<_>>()))
+            .collect();
+        // Create a RecordBatch with the ids, texts, and embeddings
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Arc::new(StringArray::from(ids)) as ArrayRef),
+                Arc::new(Arc::new(StringArray::from(texts)) as ArrayRef),
+                Arc::new(
+                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                        option_wrapped_embeddings,
+                        EMBEDDING_DIMENSIONS,
+                    ),
+                ),
+            ],
+        )?;
+        // Create a RecordBatchIterator with the single batch and the schema
+        let new_data = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        // Create a merge_insert builder for the embeddings table
+        let mut merge_insert = table.merge_insert(&["id"]);
+
+        // Configure the merge_insert builder:
+        // - Update all columns when a matching "id" is found
+        // - Insert a new record when no matching "id" is found
+        merge_insert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+
+        // Execute the merge_insert operation with the new data
+        merge_insert.execute(Box::new(new_data)).await?;
         Ok(())
+    }
+
+    pub async fn delete_texts(&self, ids: &[String]) -> Result<(), EmbedDbError> {
+        let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
+        // Properly quote each ID and join them with commas
+        let quoted_ids = ids
+            .iter()
+            .map(|s| format!("'{}'", s))
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        let delete_query = format!("id in ({})", quoted_ids);
+        table
+            .delete(&delete_query)
+            .await
+            .map_err(EmbedDbError::from)
     }
 
     /// Clears all data from the embeddings database.
@@ -225,17 +270,14 @@ impl EmbeddingsDb {
     }
 
     /// Retrieves a text from the database by its ID.
-    pub async fn get_text_by_id(
-        &self,
-        id: &str,
-    ) -> Result<Vec<TextBlock>, EmbedDbError> {
+    pub async fn get_text_by_id(&self, id: &str) -> Result<Vec<TextBlock>, EmbedDbError> {
         let filter = format!("id = '{}'", id);
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         let result = table
             .query()
             .only_if(filter)
             // no need to return embeddings
-            .select(Select::Columns(vec!["id".to_string(), "text".to_string()]))
+            .select(Self::select_columns())
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -247,7 +289,24 @@ impl EmbeddingsDb {
                 result.len()
             );
         }
-        convert_to_embed_texts(result)
+        convert_to_embed_texts(&result)
+    }
+
+    /// Return all records held in the database
+    pub async fn get_all_texts(&self) -> Result<Vec<TextBlock>, EmbedDbError> {
+        let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
+        let stream = table
+            .query()
+            .select(Self::select_columns())
+            .execute()
+            .await?;
+        let batch = stream.try_collect::<Vec<_>>().await?;
+        let texts = convert_to_embed_texts(&batch)?;
+        Ok(texts)
+    }
+
+    fn select_columns() -> Select {
+        Select::Columns(vec!["id".to_string(), "text".to_string()])
     }
 
     /// Creates a new `SimilaritySearch` instance for finding similar texts.
@@ -266,59 +325,16 @@ impl EmbeddingsDb {
         Ok(table.count_rows(None).await?)
     }
 
-    /// Generates a record batch stream from the provided data.
-    async fn get_record_batch_stream(
-        &self,
-        schema: SchemaRef,
-        ids: Vec<String>,
-        texts: Vec<String>,
-        embeddings: Vec<Vec<f32>>,
-    ) -> lancedb::Result<impl IntoArrow> {
-        // Below, from_iter_primitive creates a FixedSizeListArray from an iterator of primitive values
-        // Example
-        // let data = vec![
-        //    Some(vec![Some(0), Some(1), Some(2)]),
-        //    None,
-        //    Some(vec![Some(3), None, Some(5)]),
-        //    Some(vec![Some(6), Some(7), Some(45)]),
-        // ];
-        // let list_array = FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(data, 3);
-        // println!("{:?}", list_array);
-        //
-        // Thus we wrap all the embeddings items in Options
-        let option_wrapped_embeddings: Vec<_> = embeddings
-            .into_iter()
-            .map(|vec| Some(vec.into_iter().map(Some).collect::<Vec<_>>()))
-            .collect();
-        let batches = RecordBatchIterator::new(
-            vec![RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Arc::new(StringArray::from(ids)) as ArrayRef),
-                    Arc::new(Arc::new(StringArray::from(texts)) as ArrayRef),
-                    Arc::new(
-                        FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                            option_wrapped_embeddings,
-                            EMBEDDING_DIMENSIONS,
-                        ),
-                    ),
-                ],
-            )
-                .unwrap()]
-                .into_iter()
-                .map(Ok),
-            schema.clone(),
-        );
-        Ok(Box::new(batches))
-    }
-
-    /// Retrieves the storage path of the embeddings database.
+    /// Retrieves the storage path of the embeddings' database.
     pub(crate) fn storage_path(&self) -> String {
         self.vec_db.uri().to_string()
     }
 
     /// Creates embeddings for the given texts using the embedding engine.
-    pub(crate) fn create_embeddings(&self, texts: &[String]) -> Result<Vec<Embedding>, EmbedDbError> {
+    pub(crate) fn create_embeddings(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Embedding>, EmbedDbError> {
         self.embedding_engine
             .embed(texts.to_vec(), None)
             .map_err(EmbedDbError::from)
@@ -326,7 +342,7 @@ impl EmbeddingsDb {
 }
 
 /// Converts the record batch result to a vector of `EmbedText` instances.
-fn convert_to_embed_texts(result: Vec<RecordBatch>) -> Result<Vec<TextBlock>, EmbedDbError> {
+fn convert_to_embed_texts(result: &Vec<RecordBatch>) -> Result<Vec<TextBlock>, EmbedDbError> {
     let mut texts: Vec<TextBlock> = Vec::new();
     for item in result {
         let x: Vec<TextBlock> = serde_arrow::from_record_batch(&item)?;
@@ -345,7 +361,8 @@ fn convert_to_compared_embed_texts(
     for item in result {
         let x: Vec<ComparedTextBlock> = serde_arrow::from_record_batch(&item)?;
         if let Some(threshold_value) = threshold {
-            compared_embed_texts.extend(x.into_iter().filter(|doc| &doc.distance <= threshold_value));
+            compared_embed_texts
+                .extend(x.into_iter().filter(|doc| &doc.distance <= threshold_value));
         } else {
             compared_embed_texts.extend(x);
         }
@@ -361,13 +378,16 @@ pub enum EmbedDbError {
     LanceDb(#[from] lancedb::Error),
     #[error("SerDe error: {0}")]
     SerDe(#[from] serde_arrow::Error),
+    #[error("Arrow error: {0}")]
+    Arrow(#[from] ArrowError),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
     use std::path::Path;
+
+    use super::*;
 
     fn remove_dir_if_exists<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
         if path.as_ref().exists() {
@@ -401,6 +421,10 @@ mod tests {
                 id: "2".to_string(),
                 text: "Rust programming".to_string(),
             },
+            TextBlock {
+                id: "3".to_string(),
+                text: "LLM development".to_string(),
+            },
         ]
     }
 
@@ -422,6 +446,12 @@ mod tests {
         test_empty_db(&embed_db).await;
         embed_db.empty_db().await.unwrap();
         test_get_similar_texts(&embed_db).await;
+        embed_db.empty_db().await.unwrap();
+        test_delete_texts(&embed_db).await;
+        embed_db.empty_db().await.unwrap();
+        test_upsert_texts(&embed_db).await;
+        embed_db.empty_db().await.unwrap();
+        test_get_all_texts(&embed_db).await;
     }
 
     async fn create_embed_db(embed_db: &EmbeddingsDb, embed_db_path: &str) {
@@ -446,12 +476,12 @@ mod tests {
     }
 
     async fn test_add_texts(embed_db: &EmbeddingsDb) {
-        let texts = get_texts();
-        embed_db.add_texts(texts).await.unwrap();
+        let docs_to_add = get_texts();
+        embed_db.upsert_texts(&docs_to_add).await.unwrap();
         assert_eq!(
             embed_db.items_count().await.unwrap(),
-            2,
-            "Just added 2 docs so expecting 2 from table count"
+            docs_to_add.len(),
+            "Expecting all added docs from table count"
         );
         let record_1 = embed_db.get_text_by_id("1").await.unwrap().pop();
         assert!(record_1.is_some());
@@ -459,12 +489,12 @@ mod tests {
     }
 
     async fn test_empty_db(embed_db: &EmbeddingsDb) {
-        let texts = get_texts();
-        embed_db.add_texts(texts).await.unwrap();
+        let docs_to_add = get_texts();
+        embed_db.upsert_texts(&docs_to_add).await.unwrap();
         assert_eq!(
             embed_db.items_count().await.unwrap(),
-            2,
-            "Just added 2 docs so expecting 2 from table count"
+            docs_to_add.len(),
+            "Expecting all added texts from table count"
         );
         embed_db.empty_db().await.unwrap();
         let count = embed_db.items_count().await.unwrap();
@@ -472,10 +502,10 @@ mod tests {
     }
 
     async fn test_get_similar_texts(embed_db: &EmbeddingsDb) {
-        let texts = get_texts();
-        embed_db.add_texts(texts).await.unwrap();
+        let docs_to_add = get_texts();
+        embed_db.upsert_texts(&docs_to_add).await.unwrap();
         let search_doc = TextBlock {
-            id: "3".to_string(),
+            id: "4".to_string(),
             text: "Hello world".to_string(),
         };
         let result = embed_db
@@ -485,11 +515,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.len(),
-            2,
-            "No limit so we should see both docs returned"
+            docs_to_add.len(),
+            "No limit so we should see all docs returned"
         );
-        assert_eq!(result[0].id, "1");
-        assert_eq!(result[1].id, "2");
 
         let result = embed_db
             .get_similar_to(search_doc.clone())
@@ -522,5 +550,69 @@ mod tests {
             result[0].distance, 0.0,
             "the docs are identical so distance should be 0"
         )
+    }
+
+    async fn test_delete_texts(embed_db: &EmbeddingsDb) {
+        let docs_to_add = get_texts();
+        // test delete 1
+        embed_db.upsert_texts(&docs_to_add).await.unwrap();
+        assert_eq!(
+            docs_to_add.len(),
+            embed_db.items_count().await.unwrap(),
+            "all added texts should be present"
+        );
+        let text_ids_to_delete = vec!["1".to_string()];
+        embed_db.delete_texts(&text_ids_to_delete).await.unwrap();
+        assert_eq!(
+            docs_to_add.len() - text_ids_to_delete.len(),
+            embed_db.items_count().await.unwrap()
+        );
+        // test delete multi
+        let new_texts = vec![
+            TextBlock {
+                id: "5".to_string(),
+                text: "This is five".to_string(),
+            },
+            TextBlock {
+                id: "6".to_string(),
+                text: "This is six".to_string(),
+            },
+            TextBlock {
+                id: "7".to_string(),
+                text: "This is seven".to_string(),
+            },
+        ];
+        embed_db.upsert_texts(&new_texts).await.unwrap();
+        let db_item_count = embed_db.items_count().await.unwrap();
+        let text_ids_to_delete = vec!["6".to_string(), "7".to_string()];
+        embed_db.delete_texts(&text_ids_to_delete).await.unwrap();
+        assert_eq!(
+            db_item_count - text_ids_to_delete.len(),
+            embed_db.items_count().await.unwrap()
+        );
+    }
+
+    async fn test_upsert_texts(embed_db: &EmbeddingsDb) {
+        let docs_to_add = get_texts();
+        embed_db.upsert_texts(&docs_to_add).await.unwrap();
+        // upsert one item
+        embed_db
+            .upsert_texts(&[TextBlock {
+                id: "1".to_string(),
+                text: "Updated Text".to_string(),
+            }])
+            .await
+            .unwrap();
+        let updated_item = embed_db.get_text_by_id("1").await.unwrap();
+        assert_eq!(updated_item.len(), 1);
+        assert_eq!(updated_item[0].id, "1");
+        assert_eq!(updated_item[0].text, "Updated Text");
+    }
+
+    async fn test_get_all_texts(embed_db: &EmbeddingsDb) {
+        let docs_to_add = get_texts();
+        embed_db.upsert_texts(&docs_to_add).await.unwrap();
+        let all_texts = embed_db.get_all_texts().await.unwrap();
+        assert_eq!(all_texts.len(), docs_to_add.len());
     }
 }
