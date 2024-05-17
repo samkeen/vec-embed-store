@@ -1,6 +1,6 @@
 [package]
 name = "vec-embed-store"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "This is a thin wrapper around LanceDb (VectorDb) meant to provide a means to create/store/query embeddings in a LanceDb without the need to grok the lower level Arrow/ColumnarDb tech."
 license = "Apache-2.0"
