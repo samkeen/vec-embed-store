@@ -7,14 +7,15 @@ embeddings in a LanceDb without the need to grok the lower level Arrow/ColumnarD
 
 ```rust
 fn main() {
-    
+
     // Instance EmbeddingsDb
     let db_dir_path = "db";
     let embedding_engine_options = EmbeddingEngineOptions {
+        model_name: EmbeddingModel::BGESmallENV15,
         ..Default::default()
     };
     let embed_db = EmbeddingsDb::new(db_dir_path, embedding_engine_options).await.unwrap();
-    
+
     // Add documents
     let documents = vec![
         TextBlock {
@@ -27,7 +28,7 @@ fn main() {
         },
     ];
     embed_db.add_texts(texts).await.unwrap();
-    
+
     // check for similarities for a given document
     let search_doc = TextBlock {
         id: "3".to_string(),
@@ -40,7 +41,7 @@ fn main() {
         .execute()
         .await
         .unwrap();
-    
+
     dbg!(result)
     // result = [
     //     ComparedTextBlock {
@@ -54,14 +55,13 @@ fn main() {
     //         distance: 0.66691905,
     //     },
     // ]
-    
-    
-    
 }
 ```
-EmbedStore encapsulates the Embedding engine and the VectorDb, providing a 
+
+EmbedStore encapsulates the Embedding engine and the VectorDb, providing a
 simple interface to store and query text blocks.
-Currently,  [FastEmbed-rs](https://github.com/Anush008/fastembed-rs) is used for embeddings and [LanceDb](https://lancedb.github.io/lancedb/) is used for the vector Db
+Currently,  [FastEmbed-rs](https://github.com/Anush008/fastembed-rs) is used for embeddings
+and [LanceDb](https://lancedb.github.io/lancedb/) is used for the vector Db
 
 ```text
 

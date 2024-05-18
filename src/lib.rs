@@ -15,24 +15,26 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, FixedSizeListArray, RecordBatch, RecordBatchIterator, StringArray};
 use arrow_array::types::Float32Type;
 use arrow_schema::ArrowError;
-use fastembed::{Embedding, EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{Embedding, EmbeddingModel, InitOptions, ModelInfo, TextEmbedding};
 use futures::TryStreamExt;
 use lancedb::{connect, Connection, Table};
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use log::warn;
+use log::{info, warn};
 use serde::Deserialize;
 use thiserror::Error;
 
 const EMBED_TABLE_NAME: &str = "note_embeddings";
-const EMBEDDING_DIMENSIONS: i32 = 384;
 const DEFAULT_EMBEDDINGS_CACHE_DIR: &str = ".fastembed_cache";
+
+const DEFAULT_EMBEDDING_MODEL: EmbeddingModel = EmbeddingModel::BGESmallENV15;
 
 /// The main struct for interacting with the embeddings' database.
 pub struct EmbeddingsDb {
     vec_db: Connection,
     embedding_engine: TextEmbedding,
+    embedding_model_info: ModelInfo,
 }
 
 /// A builder-style struct for performing similarity searches on the embeddings.
@@ -117,7 +119,7 @@ pub struct ComparedTextBlock {
 /// A struct for configuring the embedding engine options.
 #[derive(Debug, Clone)]
 pub struct EmbeddingEngineOptions {
-    // pub model_name: EmbeddingModel,
+    pub model_name: EmbeddingModel,
     // pub execution_providers: Vec<ExecutionProviderDispatch>,
     // pub max_length: usize,
     pub cache_dir: PathBuf,
@@ -127,7 +129,7 @@ pub struct EmbeddingEngineOptions {
 impl Default for EmbeddingEngineOptions {
     fn default() -> Self {
         Self {
-            // model_name: DEFAULT_EMBEDDING_MODEL,
+            model_name: DEFAULT_EMBEDDING_MODEL,
             // execution_providers: Default::default(),
             // max_length: DEFAULT_MAX_LENGTH,
             cache_dir: Path::new(DEFAULT_EMBEDDINGS_CACHE_DIR).to_path_buf(),
@@ -143,14 +145,20 @@ impl EmbeddingsDb {
         embedding_engine_options: EmbeddingEngineOptions,
     ) -> Result<EmbeddingsDb, EmbedDbError> {
         let embedding_engine = TextEmbedding::try_new(InitOptions {
-            model_name: EmbeddingModel::AllMiniLML6V2,
+            model_name: embedding_engine_options.model_name,
             show_download_progress: embedding_engine_options.show_download_progress,
             cache_dir: embedding_engine_options.cache_dir,
             ..Default::default()
         })?;
+        let model_info = TextEmbedding::list_supported_models()
+            .into_iter()
+            .find(|info| info.model == DEFAULT_EMBEDDING_MODEL)
+            .ok_or(EmbedDbError::Config("Embed Model not found".to_string()))?;
+        info!("Using embedding model: {:?}", model_info);
         let db_conn = connect(db_path).execute().await?;
         let embed_db = EmbeddingsDb {
             vec_db: db_conn,
+            embedding_model_info: model_info,
             embedding_engine,
         };
         embed_db.init_table(EMBED_TABLE_NAME).await?;
@@ -190,7 +198,7 @@ impl EmbeddingsDb {
                 "embeddings",
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::Float32, true)),
-                    EMBEDDING_DIMENSIONS,
+                    self.embedding_model_info.dim as i32,
                 ),
                 true,
             ),
@@ -224,7 +232,7 @@ impl EmbeddingsDb {
                 Arc::new(
                     FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
                         option_wrapped_embeddings,
-                        EMBEDDING_DIMENSIONS,
+                        self.embedding_model_info.dim as i32,
                     ),
                 ),
             ],
@@ -380,6 +388,8 @@ pub enum EmbedDbError {
     SerDe(#[from] serde_arrow::Error),
     #[error("Arrow error: {0}")]
     Arrow(#[from] ArrowError),
+    #[error("Configuration error: {0}")]
+    Config(String),
 }
 
 #[cfg(test)]
@@ -401,6 +411,7 @@ mod tests {
         let test_db_path = "test_db";
         remove_dir_if_exists(test_db_path).expect("Failed removing test db dir");
         let embedding_engine_options = EmbeddingEngineOptions {
+            model_name: EmbeddingModel::BGESmallENV15,
             ..Default::default()
         };
         (
@@ -472,7 +483,9 @@ mod tests {
             data.len(),
             "The returned item is one vec per given data item"
         );
-        assert_eq!(embeddings[0].len() as i32, EMBEDDING_DIMENSIONS, "The embeddings within the returned vec should be 384 floats (AllMiniLML6V2 uses 384 dimensions)");
+        assert_eq!(
+            embeddings[0].len() as i32, embed_db.embedding_model_info.dim as i32,
+            "The embeddings within the returned vec should be 384 floats (AllMiniLML6V2 uses 384 dimensions)");
     }
 
     async fn test_add_texts(embed_db: &EmbeddingsDb) {
