@@ -21,8 +21,8 @@ use lancedb::{connect, Connection, Table};
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 use lancedb::index::Index;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
-use log::{info, warn};
-use serde::Deserialize;
+use log::{error, info};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const EMBED_TABLE_NAME: &str = "note_embeddings";
@@ -40,37 +40,101 @@ pub struct EmbeddingsDb {
 /// A builder-style struct for performing similarity searches on the embeddings.
 pub struct SimilaritySearch<'a> {
     embed_db: &'a EmbeddingsDb,
-    embed_text: TextBlock,
+    similar_text: String,
     threshold: Option<f32>,
     limit: Option<usize>,
 }
 
 impl<'a> SimilaritySearch<'a> {
     /// Creates a new `SimilaritySearch` instance.
-    pub fn new(embed_db: &'a EmbeddingsDb, embed_text: TextBlock) -> Self {
-        SimilaritySearch {
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions, TextChunk, SimilaritySearch};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// let embed_text = "Example text";
+    /// let search = SimilaritySearch::new(&embed_db, embed_text);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(embed_db: &'a EmbeddingsDb, similar_text: &str) -> Self {
+        Self {
             embed_db,
-            embed_text,
+            similar_text: similar_text.into(),
             threshold: None,
             limit: None,
         }
     }
 
     /// Sets the similarity threshold for the search.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions, TextChunk, SimilaritySearch};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// # let embed_text = "Example text";
+    /// let search = SimilaritySearch::new(&embed_db, embed_text)
+    ///     .threshold(0.8);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn threshold(mut self, threshold: f32) -> Self {
         self.threshold = Some(threshold);
         self
     }
 
     /// Sets the maximum number of results to return.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions, TextChunk, SimilaritySearch};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// # let embed_text = "Example text";
+    /// let search = SimilaritySearch::new(&embed_db, embed_text)
+    ///     .limit(10);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = Some(limit);
         self
     }
 
     /// Executes the similarity search and returns the results.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions, TextChunk, SimilaritySearch};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// # let embed_text = "Example text";
+    /// let results = SimilaritySearch::new(&embed_db, embed_text)
+    ///     .threshold(0.8)
+    ///     .limit(10)
+    ///     .execute()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    /// let results = SimilaritySearch::new(&embed_db, embed_text)
+    ///     .threshold(0.8)
+    ///     .limit(10)
+    ///     .execute()
+    ///     .await?;
+    /// ```
     pub async fn execute(self) -> Result<Vec<ComparedTextBlock>, EmbedDbError> {
-        let embedding = self.embed_db.create_embeddings(&[self.embed_text.text])?;
+        let embedding = self.embed_db.create_embeddings(&[self.similar_text])?;
         // flattening a 2D vector into a 1D vector. This is necessary because the search
         // function of the Table trait expects a 1D vector as input. However, the
         // create_embeddings function returns a 2D vector (a vector of embeddings,
@@ -96,19 +160,19 @@ impl<'a> SimilaritySearch<'a> {
             query
         };
         let result = query.execute().await?.try_collect::<Vec<_>>().await?;
-        convert_to_compared_embed_texts(result, &self.threshold)
+        EmbeddingsDb::convert_to_compared_embed_texts(result, &self.threshold)
     }
 }
 
 /// A struct representing a text to be embedded and stored in the database.
-#[derive(Deserialize, Clone, Debug)]
-pub struct TextBlock {
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TextChunk {
     pub id: String,
     pub text: String,
 }
 
 /// A struct representing a text with its similarity distance after a search.
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ComparedTextBlock {
     pub id: String,
     pub text: String,
@@ -140,6 +204,17 @@ impl Default for EmbeddingEngineOptions {
 
 impl EmbeddingsDb {
     /// Creates a new instance of `EmbeddingsDb`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn new(
         db_path: &str,
         embedding_engine_options: EmbeddingEngineOptions,
@@ -167,12 +242,12 @@ impl EmbeddingsDb {
     }
 
     /// Retrieves the names of all tables in the database.
-    pub async fn get_table_names(&self) -> Result<Vec<String>, EmbedDbError> {
+    pub(crate) async fn get_table_names(&self) -> Result<Vec<String>, EmbedDbError> {
         self.vec_db
             .table_names()
             .execute()
             .await
-            .map_err(EmbedDbError::LanceDb)
+            .map_err(EmbedDbError::VectorDbEngine)
     }
 
     /// Initializes the embeddings table if it doesn't exist.
@@ -205,7 +280,30 @@ impl EmbeddingsDb {
         ]))
     }
 
-    pub async fn upsert_texts(&self, texts: &[TextBlock]) -> Result<(), EmbedDbError> {
+    /// Upserts a collection of texts into the embeddings database.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions, TextChunk};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// let texts = vec![
+    ///     TextChunk {
+    ///         id: "1".to_string(),
+    ///         text: "Example text 1".to_string(),
+    ///     },
+    ///     TextChunk {
+    ///         id: "2".to_string(),
+    ///         text: "Example text 2".to_string(),
+    ///     },
+    /// ];
+    /// embed_db.upsert_texts(&texts).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn upsert_texts(&self, texts: &[TextChunk]) -> Result<(), EmbedDbError> {
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         // Extract the ids and texts from the input TextBlock vector
         let ids: Vec<String> = texts.iter().map(|doc| doc.id.to_string()).collect();
@@ -254,6 +352,20 @@ impl EmbeddingsDb {
         Ok(())
     }
 
+    /// Deletes texts from the embeddings database by their IDs.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// let ids = vec!["1".to_string(), "2".to_string()];
+    /// embed_db.delete_texts(&ids).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn delete_texts(&self, ids: &[String]) -> Result<(), EmbedDbError> {
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         // Properly quote each ID and join them with commas
@@ -271,6 +383,18 @@ impl EmbeddingsDb {
     }
 
     /// Clears all data from the embeddings database.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// embed_db.empty_db().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn empty_db(&self) -> Result<(), EmbedDbError> {
         self.vec_db.drop_table(EMBED_TABLE_NAME).await?;
         self.init_table(EMBED_TABLE_NAME).await?;
@@ -278,7 +402,19 @@ impl EmbeddingsDb {
     }
 
     /// Retrieves a text from the database by its ID.
-    pub async fn get_text_by_id(&self, id: &str) -> Result<Vec<TextBlock>, EmbedDbError> {
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// let text = embed_db.get_text_by_id("1").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_text_by_id(&self, id: &str) -> Result<Option<TextChunk>, EmbedDbError> {
         let filter = format!("id = '{}'", id);
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         let result = table
@@ -290,18 +426,40 @@ impl EmbeddingsDb {
             .await?
             .try_collect::<Vec<_>>()
             .await?;
-        if result.len() > 1 {
-            warn!(
-                "Greater than one record returned for id {}. Found {} total",
-                id,
-                result.len()
-            );
+
+        match result.as_slice() {
+            [] => Ok(None),
+            [single_result] => {
+                let mut texts = Self::convert_to_embed_texts(&vec![single_result.clone()])?;
+                Ok(texts.pop())
+            }
+            _ => {
+                let err_msg = format!(
+                    "Greater than one record returned for id {}. Found {} total",
+                    id,
+                    result.len()
+                )
+                    .to_string();
+                error!("{}", &err_msg);
+                Err(EmbedDbError::InvalidState(err_msg))
+            }
         }
-        convert_to_embed_texts(&result)
     }
 
-    /// Return all records held in the database
-    pub async fn get_all_texts(&self) -> Result<Vec<TextBlock>, EmbedDbError> {
+    /// Returns all records held in the database.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// let all_texts = embed_db.get_all_texts().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_all_texts(&self) -> Result<Vec<TextChunk>, EmbedDbError> {
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         let stream = table
             .query()
@@ -309,7 +467,7 @@ impl EmbeddingsDb {
             .execute()
             .await?;
         let batch = stream.try_collect::<Vec<_>>().await?;
-        let texts = convert_to_embed_texts(&batch)?;
+        let texts = Self::convert_to_embed_texts(&batch)?;
         Ok(texts)
     }
 
@@ -318,16 +476,44 @@ impl EmbeddingsDb {
     }
 
     /// Creates a new `SimilaritySearch` instance for finding similar texts.
-    pub fn get_similar_to(&self, embed_text: TextBlock) -> SimilaritySearch {
-        SimilaritySearch::new(self, embed_text)
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions, TextChunk};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// # let search_text = "Example text";
+    /// let search = embed_db.get_similar_to(search_text);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_similar_to(&self, similar_text: &str) -> SimilaritySearch {
+        SimilaritySearch::new(self, similar_text)
     }
 
     /// Creates an index on the embeddings table.
-    pub async fn create_index(table: &Table) -> lancedb::Result<()> {
-        table.create_index(&["vector"], Index::Auto).execute().await
+    pub async fn create_index(table: &Table) -> Result<(), EmbedDbError> {
+        table
+            .create_index(&["vector"], Index::Auto)
+            .execute()
+            .await
+            .map_err(EmbedDbError::VectorDbEngine)
     }
 
     /// Retrieves the total number of items in the embeddings database.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use vec_embed_store::{EmbeddingsDb, EmbeddingEngineOptions};
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let embed_db = EmbeddingsDb::new("path/to/db", EmbeddingEngineOptions::default()).await?;
+    /// let count = embed_db.items_count().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn items_count(&self) -> Result<usize, EmbedDbError> {
         let table = self.vec_db.open_table(EMBED_TABLE_NAME).execute().await?;
         Ok(table.count_rows(None).await?)
@@ -347,49 +533,51 @@ impl EmbeddingsDb {
             .embed(texts.to_vec(), None)
             .map_err(EmbedDbError::from)
     }
-}
 
-/// Converts the record batch result to a vector of `EmbedText` instances.
-fn convert_to_embed_texts(result: &Vec<RecordBatch>) -> Result<Vec<TextBlock>, EmbedDbError> {
-    let mut texts: Vec<TextBlock> = Vec::new();
-    for item in result {
-        let x: Vec<TextBlock> = serde_arrow::from_record_batch(&item)?;
-        texts.extend(x);
-    }
-    Ok(texts)
-}
-
-/// Converts the record batch result to a vector of `ComparedEmbedText` instances,
-/// filtering based on the provided threshold.
-fn convert_to_compared_embed_texts(
-    result: Vec<RecordBatch>,
-    threshold: &Option<f32>,
-) -> Result<Vec<ComparedTextBlock>, EmbedDbError> {
-    let mut compared_embed_texts: Vec<ComparedTextBlock> = Vec::new();
-    for item in result {
-        let x: Vec<ComparedTextBlock> = serde_arrow::from_record_batch(&item)?;
-        if let Some(threshold_value) = threshold {
-            compared_embed_texts
-                .extend(x.into_iter().filter(|doc| &doc.distance <= threshold_value));
-        } else {
-            compared_embed_texts.extend(x);
+    /// Converts the record batch result to a vector of `EmbedText` instances.
+    fn convert_to_embed_texts(result: &Vec<RecordBatch>) -> Result<Vec<TextChunk>, EmbedDbError> {
+        let mut texts: Vec<TextChunk> = Vec::new();
+        for item in result {
+            let x: Vec<TextChunk> = serde_arrow::from_record_batch(item)?;
+            texts.extend(x);
         }
+        Ok(texts)
     }
-    Ok(compared_embed_texts)
+
+    /// Converts the record batch result to a vector of `ComparedEmbedText` instances,
+    /// filtering based on the provided threshold.
+    fn convert_to_compared_embed_texts(
+        result: Vec<RecordBatch>,
+        threshold: &Option<f32>,
+    ) -> Result<Vec<ComparedTextBlock>, EmbedDbError> {
+        let mut compared_embed_texts: Vec<ComparedTextBlock> = Vec::new();
+        for item in result {
+            let x: Vec<ComparedTextBlock> = serde_arrow::from_record_batch(&item)?;
+            if let Some(threshold_value) = threshold {
+                compared_embed_texts
+                    .extend(x.into_iter().filter(|doc| &doc.distance <= threshold_value));
+            } else {
+                compared_embed_texts.extend(x);
+            }
+        }
+        Ok(compared_embed_texts)
+    }
 }
 
 #[derive(Error, Debug)]
 pub enum EmbedDbError {
     #[error("Embedding error: {0}")]
-    Embedding(#[from] anyhow::Error),
+    EmbeddingsEngine(#[from] anyhow::Error),
     #[error("LanceDb error: {0}")]
-    LanceDb(#[from] lancedb::Error),
+    VectorDbEngine(#[from] lancedb::Error),
     #[error("SerDe error: {0}")]
     SerDe(#[from] serde_arrow::Error),
     #[error("Arrow error: {0}")]
     Arrow(#[from] ArrowError),
     #[error("Configuration error: {0}")]
     Config(String),
+    #[error("Invalid State error: {0}")]
+    InvalidState(String),
 }
 
 #[cfg(test)]
@@ -422,17 +610,17 @@ mod tests {
         )
     }
 
-    fn get_texts() -> Vec<TextBlock> {
+    fn get_texts() -> Vec<TextChunk> {
         vec![
-            TextBlock {
+            TextChunk {
                 id: "1".to_string(),
                 text: "Hello world".to_string(),
             },
-            TextBlock {
+            TextChunk {
                 id: "2".to_string(),
                 text: "Rust programming".to_string(),
             },
-            TextBlock {
+            TextChunk {
                 id: "3".to_string(),
                 text: "LLM development".to_string(),
             },
@@ -496,7 +684,7 @@ mod tests {
             docs_to_add.len(),
             "Expecting all added docs from table count"
         );
-        let record_1 = embed_db.get_text_by_id("1").await.unwrap().pop();
+        let record_1 = embed_db.get_text_by_id("1").await.unwrap();
         assert!(record_1.is_some());
         assert_eq!("Hello world", record_1.unwrap().text)
     }
@@ -517,12 +705,9 @@ mod tests {
     async fn test_get_similar_texts(embed_db: &EmbeddingsDb) {
         let docs_to_add = get_texts();
         embed_db.upsert_texts(&docs_to_add).await.unwrap();
-        let search_doc = TextBlock {
-            id: "4".to_string(),
-            text: "Hello world".to_string(),
-        };
+        let search_doc = "Hello world";
         let result = embed_db
-            .get_similar_to(search_doc.clone())
+            .get_similar_to(search_doc)
             .execute()
             .await
             .unwrap();
@@ -533,7 +718,7 @@ mod tests {
         );
 
         let result = embed_db
-            .get_similar_to(search_doc.clone())
+            .get_similar_to(search_doc)
             .limit(1)
             .execute()
             .await
@@ -545,7 +730,7 @@ mod tests {
         );
 
         let result = embed_db
-            .get_similar_to(search_doc.clone())
+            .get_similar_to(search_doc)
             .threshold(0.001)
             .execute()
             .await
@@ -582,15 +767,15 @@ mod tests {
         );
         // test delete multi
         let new_texts = vec![
-            TextBlock {
+            TextChunk {
                 id: "5".to_string(),
                 text: "This is five".to_string(),
             },
-            TextBlock {
+            TextChunk {
                 id: "6".to_string(),
                 text: "This is six".to_string(),
             },
-            TextBlock {
+            TextChunk {
                 id: "7".to_string(),
                 text: "This is seven".to_string(),
             },
@@ -610,16 +795,15 @@ mod tests {
         embed_db.upsert_texts(&docs_to_add).await.unwrap();
         // upsert one item
         embed_db
-            .upsert_texts(&[TextBlock {
+            .upsert_texts(&[TextChunk {
                 id: "1".to_string(),
                 text: "Updated Text".to_string(),
             }])
             .await
             .unwrap();
-        let updated_item = embed_db.get_text_by_id("1").await.unwrap();
-        assert_eq!(updated_item.len(), 1);
-        assert_eq!(updated_item[0].id, "1");
-        assert_eq!(updated_item[0].text, "Updated Text");
+        let updated_item = embed_db.get_text_by_id("1").await.unwrap().unwrap();
+        assert_eq!(updated_item.id, "1");
+        assert_eq!(updated_item.text, "Updated Text");
     }
 
     async fn test_get_all_texts(embed_db: &EmbeddingsDb) {
