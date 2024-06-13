@@ -6,16 +6,18 @@ description = "This is a thin wrapper around LanceDb (VectorDb) meant to provide
 license = "Apache-2.0"
 
 [dependencies]
-anyhow = "1.0.83"
-fastembed = "3.5.0"
-lancedb = "0.4.20"
+# ATM fastembed needs 1.0.82
+anyhow = "1.0.82"
+fastembed = "3.6.0"
+lancedb = "0.5.2"
+# ATM lancedb is using arrow 51
 arrow-array = "51.0.0"
 arrow-schema = "51.0.0"
-serde_arrow = { version = "0.11.3", features = ["arrow-51"] }
+serde_arrow = { version = "0.11.5", features = ["arrow-51"] }
 tempfile = "3.10.1"
-thiserror = "1.0.60"
-tokio = { version = "1.37.0", features = ["full"] }
+thiserror = "1.0.61"
+tokio = { version = "1.38.0", features = ["full"] }
 log = "0.4.21"
 futures = "0.3.30"
-serde = { version = "1.0.200", features = ["derive"] }
+serde = { version = "1.0.203", features = ["derive"] }
 lazy_static = "1.4.0"
