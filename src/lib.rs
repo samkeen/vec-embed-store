@@ -9,6 +9,8 @@
 //! - `EmbedText`: A struct representing a text to be embedded and stored in the database.
 //! - `ComparedEmbedText`: A struct representing a text with its similarity distance after a search.
 //! - `EmbeddingEngineOptions`: A struct for configuring the embedding engine options.
+#![warn(missing_debug_implementations, rust_2018_idioms, missing_docs)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
