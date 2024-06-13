@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1](https://github.com/samkeen/vec-embed-store/compare/v0.3.0...v0.3.1) - 2024-06-13
+
+### Other
+- Merge pull request [#13](https://github.com/samkeen/vec-embed-store/pull/13) from samkeen/chore/update-dependencies
+- updated dependencies
+
 ## [0.3.0](https://github.com/samkeen/vec-embed-store/compare/v0.2.0...v0.3.0) - 2024-05-19
 
 ### Fixed
